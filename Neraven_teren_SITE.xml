@@ -1,0 +1,179 @@
+<mujoco>
+  <option gravity="0 0 -9.81"
+          timestep="0.002"
+          integrator="RK4"/>
+
+  <default>
+    <default class="joint_kolo">
+      <joint type="hinge" axis="0 1 0" damping="1.0"/>
+    </default>
+
+    <default class="geom_kolo">
+      <geom type="cylinder" size="0.1 0.05" euler="90 0 0"
+            rgba="0.2 0.2 0.2 0.5"
+            friction="0.22 0.006 0.0002"/>
+    </default>
+
+    <default class="motor_kolo">
+      <motor ctrlrange="-20 20" ctrllimited="true" gear="60"/>
+    </default>
+  </default>
+
+  <asset>
+    <hfield name="teren"
+            file="terrains/terrain16.png"
+            size="30 30 0.25 0.1"/>
+
+    <texture name="tex_materiali"
+             type="2d"
+             file="terrains/material_map_vis.png"/>
+
+    <material name="mat_teren"
+              texture="tex_materiali"
+              texuniform="false"
+              texrepeat="1 1"
+              rgba="1 1 1 1"/>
+  </asset>
+
+  <worldbody>
+    <!-- luč -->
+    <light pos="10 -6 5"
+       dir="-1 0.6 -0.4"
+       directional="true"
+       castshadow="true"/>
+
+    <!-- neraven teren -->
+    <geom name="terrain"
+          type="hfield"
+          hfield="teren"
+          pos="0 0 0"
+          material="mat_teren"
+          friction="0.22 0.006 0.0002"/>
+
+    <!-- glavno telo -->
+    <body name="sasija" pos="1.2 0 0.9" euler="0 0 90">
+      <freejoint name="root"/>
+
+      <!-- spodnji trup -->
+      <geom name="trup_spodaj" type="box"
+            size="0.72 0.50 0.08"
+            mass="50"
+            rgba="0.50 0.90 0.90 0.6"/>
+
+      <!-- zgornji trup -->
+      <geom name="trup_zgoraj" type="box"
+            pos="0 0 0.09"
+            size="0.40 0.20 0.04"
+            rgba="0.45 0.50 0.45 0.9"/>
+
+      <!-- marker spredaj -->
+      <geom name="marker_spredaj" type="box"
+            size="0.08 0.05 0.05"
+            pos="0.78 0 0.05"
+            rgba="1 0 0 1"
+            contype="0" conaffinity="0"/>
+
+      <!-- SITE markerji za G4 force-injection.
+           Mentorjeva pripomba: sile ne apliciramo vec na geometrijo/ohisje,
+           ampak na namenski tocki leve in desne gosenice. Lokalna +X os sasije
+           je smer naprej. -->
+      <site name="drive_L" pos="0 0.50 -0.15" size="0.025" rgba="1 0 0 1"/>
+      <site name="drive_R" pos="0 -0.50 -0.15" size="0.025" rgba="0 0 1 1"/>
+      <site name="drive_C" pos="0 0 -0.12" size="0.018" rgba="0 1 0 1"/>
+
+      <!-- LEVA STRAN -->
+      <body name="L1" pos="0.60 0.50 -0.15">
+        <joint name="j_L1" class="joint_kolo"/>
+        <geom class="geom_kolo"/>
+      </body>
+
+      <body name="L2" pos="0.36 0.50 -0.15">
+        <joint name="j_L2" class="joint_kolo"/>
+        <geom class="geom_kolo"/>
+      </body>
+
+      <body name="L3" pos="0.12 0.50 -0.15">
+        <joint name="j_L3" class="joint_kolo"/>
+        <geom class="geom_kolo"/>
+      </body>
+
+      <body name="L4" pos="-0.12 0.50 -0.15">
+        <joint name="j_L4" class="joint_kolo"/>
+        <geom class="geom_kolo"/>
+      </body>
+
+      <body name="L5" pos="-0.36 0.50 -0.15">
+        <joint name="j_L5" class="joint_kolo"/>
+        <geom class="geom_kolo"/>
+      </body>
+
+      <body name="L6" pos="-0.60 0.50 -0.15">
+        <joint name="j_L6" type="hinge" class="joint_kolo"/>
+        <geom class="geom_kolo"/>
+      </body>
+
+      <!-- DESNA STRAN -->
+      <body name="D1" pos="0.60 -0.50 -0.15">
+        <joint name="j_D1" class="joint_kolo"/>
+        <geom class="geom_kolo"/>
+      </body>
+
+      <body name="D2" pos="0.36 -0.50 -0.15">
+        <joint name="j_D2" class="joint_kolo"/>
+        <geom class="geom_kolo"/>
+      </body>
+
+      <body name="D3" pos="0.12 -0.50 -0.15">
+        <joint name="j_D3" class="joint_kolo"/>
+        <geom class="geom_kolo"/>
+      </body>
+
+      <body name="D4" pos="-0.12 -0.50 -0.15">
+        <joint name="j_D4" class="joint_kolo"/>
+        <geom class="geom_kolo"/>
+      </body>
+
+      <body name="D5" pos="-0.36 -0.50 -0.15">
+        <joint name="j_D5" class="joint_kolo"/>
+        <geom class="geom_kolo"/>
+      </body>
+
+      <body name="D6" pos="-0.60 -0.50 -0.15">
+        <joint name="j_D6" class="joint_kolo"/>
+        <geom class="geom_kolo"/>
+      </body>
+    </body>
+  </worldbody>
+
+  <!-- direktni motorji za vsako kolo posebej -->
+  <actuator>
+    <!-- G4 SITE aktuatorji: ctrl vrednosti so sile [N] oziroma moment [Nm].
+         gear="1 0 0 0 0 0" pomeni sila v lokalni +X smeri site-a.
+         gear="0 0 0 0 0 1" pomeni navor okoli lokalne +Z osi. -->
+    <motor name="drive_L_force" site="drive_L" gear="1 0 0 0 0 0"
+           ctrlrange="-2500 2500" ctrllimited="true"/>
+    <motor name="drive_R_force" site="drive_R" gear="1 0 0 0 0 0"
+           ctrlrange="-2500 2500" ctrllimited="true"/>
+    <motor name="scrub_yaw_torque" site="drive_C" gear="0 0 0 0 0 1"
+           ctrlrange="-2500 2500" ctrllimited="true"/>
+
+    <motor name="L1_motor" joint="j_L1" class="motor_kolo"/>
+    <motor name="L2_motor" joint="j_L2" class="motor_kolo"/>
+    <motor name="L3_motor" joint="j_L3" class="motor_kolo"/>
+    <motor name="L4_motor" joint="j_L4" class="motor_kolo"/>
+    <motor name="L5_motor" joint="j_L5" class="motor_kolo"/>
+    <motor name="L6_motor" joint="j_L6" class="motor_kolo"/>
+
+    <motor name="D1_motor" joint="j_D1" class="motor_kolo"/>
+    <motor name="D2_motor" joint="j_D2" class="motor_kolo"/>
+    <motor name="D3_motor" joint="j_D3" class="motor_kolo"/>
+    <motor name="D4_motor" joint="j_D4" class="motor_kolo"/>
+    <motor name="D5_motor" joint="j_D5" class="motor_kolo"/>
+    <motor name="D6_motor" joint="j_D6" class="motor_kolo"/>
+  </actuator>
+
+  <sensor>
+    <framepos name="pozicija_tanka" objtype="body" objname="sasija"/>
+    <framelinvel name="hitrost_tanka" objtype="body" objname="sasija"/>
+  </sensor>
+</mujoco>

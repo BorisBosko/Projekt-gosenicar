@@ -1,0 +1,14 @@
+[project]
+name = "skid-phase2-g4"
+version = "0.1.0"
+description = "MuJoCo G4 skid-steer terramechanics simulator with SITE force actuators"
+requires-python = ">=3.10,<3.14"
+dependencies = [
+  "mujoco==3.3.2",
+  "numpy==2.2.6",
+  "pillow==11.2.1",
+  "matplotlib==3.10.3",
+]
+
+[tool.uv]
+package = false
