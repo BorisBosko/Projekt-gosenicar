@@ -1,4 +1,4 @@
-******Skid-steer Faza 2*******
+******Tracked vehicle-skid-steer-project******
 
 Projekt implementira simulacijo skid-steer vozila oziroma goseničarja v okolju MuJoCo. Model vključuje raven in neraven teren, tri tipe podlage, terramechanics/slip model, analizo kontaktov s podlago ter ROS 2 bridge.
 
