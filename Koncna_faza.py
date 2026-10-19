@@ -11,6 +11,7 @@ import csv
 import matplotlib
 matplotlib.use("Agg")  # shrani grafe v PNG tudi, ko tece MuJoCo viewer
 import matplotlib.pyplot as plt
+import argparse                         # CLI preklop native/hybrid
 
 
 @dataclass
@@ -53,6 +54,17 @@ class TerramechanicsParams:
     crr_lambda_gain: float = 0.045
     crr_mu_gain: float = 0.015
 
+    # Stabilizacija normalne obremenitve samo za rolling resistance.
+    # Surove MuJoCo kontaktne sile lahko zaradi kontaktnega solverja mocno nihajo
+    # in imajo sunkovite vrhove, zato jih ne uporabljamo neposredno kot Fz v F_rr.
+    # Skupna efektivna obremenitev za F_rr ostane m*g, razmerje levo/desno pa
+    # ohranimo iz kontaktov in ga nizkoprepustno filtriramo.
+    rr_load_balance_tau_s: float = 0.12
+
+    # Gladko ugašanje rolling resistance okoli v=0, da sila ne preklaplja
+    # sunkovito med +F_rr in -F_rr ob majhnih numeričnih spremembah predznaka.
+    rr_velocity_scale_mps: float = 0.08
+
     # Scrub torque pri zavijanju na mestu / drsenju gosenic.
     # Scrub mora biti opazen, ne sme pa premagati pogona in povzrociti ciklicnega
     # ustavljanja pivot obrata.
@@ -88,6 +100,7 @@ class TerramechanicsCore:
         self._omega_filt = 0.0
         self._F_total_cmd_prev = 0.0
         self._M_cmd_prev = 0.0
+        self._rr_left_fraction_filt = 0.5
         self._last = {}
 
     @staticmethod
@@ -117,6 +130,7 @@ class TerramechanicsCore:
         self._omega_filt = 0.0
         self._F_total_cmd_prev = 0.0
         self._M_cmd_prev = 0.0
+        self._rr_left_fraction_filt = 0.5
         self._last = {}
 
     def slip_from_terrain(self, mu: float, lam: float, vcmd: float, omega_cmd: float):
@@ -153,7 +167,7 @@ class TerramechanicsCore:
         sigma_omega = self._clip(sigma_omega, self.p.sigma_omega_min, self.p.sigma_omega_max)
         return sigma_v, sigma_omega
 
-    def step(self, dt: float, cmd: dict, terrain: dict, loads: dict, state: dict):
+    def step(self, dt: float, cmd: dict, terrain: dict, loads: dict, state: dict, coast: bool = False):
         """
         Glavni korak G4.
 
@@ -162,7 +176,8 @@ class TerramechanicsCore:
           cmd     - {"v_cmd": ..., "omega_cmd": ...},
           terrain - {"mu": ..., "lambda": ...},
           loads   - {"Fz_left": ..., "Fz_right": ...},
-          state   - {"v_forward": ..., "yaw_rate": ...}
+          state   - {"v_forward": ..., "omega_body": ...}
+          coast   - True: aktivni pogon je 0, ostaneta pa F_rr in M_scrub
         """
         dt = max(1e-6, float(dt))
         mu = float(terrain.get("mu", 0.8))
@@ -180,6 +195,16 @@ class TerramechanicsCore:
         vcmd = self._v_filt
         omega_cmd = self._omega_filt
 
+        # COAST TEST:
+        # Aktivni pogon mora biti popolnoma izklopljen, terramehanski pasivni
+        # upori pa morajo ostati aktivni. Zato v coast režimu tudi notranji
+        # filtrirani ukaz takoj postavimo na 0, da ni preostalega motornega ukaza.
+        if coast:
+            self._v_filt = 0.0
+            self._omega_filt = 0.0
+            vcmd = 0.0
+            omega_cmd = 0.0
+
         Fz_left = max(0.0, float(loads.get("Fz_left", 0.0)))
         Fz_right = max(0.0, float(loads.get("Fz_right", 0.0)))
         Fz_total = Fz_left + Fz_right
@@ -191,59 +216,81 @@ class TerramechanicsCore:
             Fz_right = 0.5 * Fz_total
 
         v_body = float(state.get("v_forward", 0.0))
-        yaw_rate = float(state.get("yaw_rate", 0.0))
+        omega_body = float(state.get("omega_body", 0.0))
 
         sigma_v, sigma_omega = self.slip_from_terrain(mu, lam, vcmd, omega_cmd)
         v_ref = vcmd * (1.0 - sigma_v)
         omega_ref = omega_cmd * (1.0 - sigma_omega)
 
-        # Hitrostna napaka -> sila/moment. tanh saturacija prepreči "letenje" pri sunkih.
-        # Pomembno: regulator NI vec bang-bang. Zmerni gaini + rate limit odstranijo
-        # ciklicno pospesevanje/zaviranje, ki se je videlo pri pivotu.
-        F_total_request = self.p.kv_force * self.p.mass_kg * (v_ref - v_body)
+        # Hitrostna napaka -> sila/moment. V normalni vožnji regulator iz
+        # (v_ref-v_body) in (omega_ref-omega_body) izračuna aktivni pogon.
+        #
+        # COAST TEST je namenoma drugačen:
+        #   FL_drive = FR_drive = 0
+        #   aktivni yaw pogon = 0
+        #   F_rr in M_scrub pa se kasneje še vedno izračunata in aplicirata.
+        if coast:
+            F_total_request = 0.0
+            M_scrub_feedforward = 0.0
+            M_request = 0.0
+            F_total_target = 0.0
+            M_target = 0.0
+            F_total_cmd = 0.0
+            M_cmd = 0.0
 
-        # Feed-forward kompenzacija scrub upora: ce zelimo stalen pivot, mora pogon
-        # ze vnaprej premagati del striznega upora tal. Brez tega se pivot pri dosezeni
-        # kotni hitrosti upocasni, potem regulator spet sunkovito pospesi.
-        b_for_scrub = max(0.05, float(self.p.track_width_m))
-        Fz_for_scrub = max(1.0, Fz_total)
-        scrub_ff_mag = (
-            self.p.scrub_gain
-            * mu
-            * (1.0 + 1.4 * lam)
-            * Fz_for_scrub
-            * 0.5 * b_for_scrub
-            * np.tanh(abs(omega_ref) / max(self.p.scrub_omega_scale, 1e-6))
-        )
-        M_scrub_feedforward = self.p.scrub_compensation * self._sign_nonzero(omega_ref, fallback=omega_cmd) * scrub_ff_mag
+            # Izničimo tudi prejšnje stanje rate limiterja, da po pritisku COAST
+            # ne ostane niti en korak preostale aktivne pogonske sile.
+            self._F_total_cmd_prev = 0.0
+            self._M_cmd_prev = 0.0
+        else:
+            # Pomembno: regulator NI vec bang-bang. Zmerni gaini + rate limit odstranijo
+            # ciklicno pospesevanje/zaviranje, ki se je videlo pri pivotu.
+            F_total_request = self.p.kv_force * self.p.mass_kg * (v_ref - v_body)
 
-        M_request = (
-            self.p.kw_moment * self.p.yaw_inertia_kgm2 * (omega_ref - yaw_rate)
-            + M_scrub_feedforward
-        )
+            # Feed-forward kompenzacija scrub upora: ce zelimo stalen pivot, mora pogon
+            # ze vnaprej premagati del striznega upora tal.
+            b_for_scrub = max(0.05, float(self.p.track_width_m))
+            Fz_for_scrub = max(1.0, Fz_total)
+            scrub_ff_mag = (
+                self.p.scrub_gain
+                * mu
+                * (1.0 + 1.4 * lam)
+                * Fz_for_scrub
+                * 0.5 * b_for_scrub
+                * np.tanh(abs(omega_ref) / max(self.p.scrub_omega_scale, 1e-6))
+            )
+            M_scrub_feedforward = (
+                self.p.scrub_compensation
+                * self._sign_nonzero(omega_ref, fallback=omega_cmd)
+                * scrub_ff_mag
+            )
 
-        # Globalna omejitev pogona po sili in momentu.
-        F_total_limit = 2.0 * self.p.max_side_force_N
-        M_limit = self.p.max_side_force_N * self.p.track_width_m
-        F_total_target = F_total_limit * np.tanh(F_total_request / max(F_total_limit, 1e-6))
-        M_target = M_limit * np.tanh(M_request / max(M_limit, 1e-6))
+            M_request = (
+                self.p.kw_moment * self.p.yaw_inertia_kgm2 * (omega_ref - omega_body)
+                + M_scrub_feedforward
+            )
 
-        # Fiksno-casovno omejevanje spremembe sil/momentov. To je notranja dinamika
-        # G4 in uporablja natanko isti dt kot MuJoCo.
-        F_total_cmd = self._rate_limit(
-            self._F_total_cmd_prev,
-            F_total_target,
-            self.p.force_rate_limit_N_per_s,
-            dt,
-        )
-        M_cmd = self._rate_limit(
-            self._M_cmd_prev,
-            M_target,
-            self.p.moment_rate_limit_Nm_per_s,
-            dt,
-        )
-        self._F_total_cmd_prev = float(F_total_cmd)
-        self._M_cmd_prev = float(M_cmd)
+            # Globalna omejitev pogona po sili in momentu.
+            F_total_limit = 2.0 * self.p.max_side_force_N
+            M_limit = self.p.max_side_force_N * self.p.track_width_m
+            F_total_target = F_total_limit * np.tanh(F_total_request / max(F_total_limit, 1e-6))
+            M_target = M_limit * np.tanh(M_request / max(M_limit, 1e-6))
+
+            # Fiksno-casovno omejevanje spremembe sil/momentov.
+            F_total_cmd = self._rate_limit(
+                self._F_total_cmd_prev,
+                F_total_target,
+                self.p.force_rate_limit_N_per_s,
+                dt,
+            )
+            M_cmd = self._rate_limit(
+                self._M_cmd_prev,
+                M_target,
+                self.p.moment_rate_limit_Nm_per_s,
+                dt,
+            )
+            self._F_total_cmd_prev = float(F_total_cmd)
+            self._M_cmd_prev = float(M_cmd)
 
         b = max(0.05, float(self.p.track_width_m))
 
@@ -259,27 +306,57 @@ class TerramechanicsCore:
         FL_drive = FL_cap * np.tanh(FL_drive / max(FL_cap, 1e-6))
         FR_drive = FR_cap * np.tanh(FR_drive / max(FR_cap, 1e-6))
 
-        # Rolling resistance je sorazmeren z normalno silo in raste z lambda.
+        # Rolling resistance je sorazmeren z normalno obremenitvijo in raste z lambda.
+        #
+        # POMEMBNO:
+        # Surovih trenutnih MuJoCo kontaktnih sil Fz_left/Fz_right ne uporabimo
+        # neposredno kot absolutno velikost F_rr, ker kontaktni solver pri kolesih
+        # ustvarja sunkovite vrhove, ki so lahko veckrat vecji od staticne teze m*g.
+        #
+        # Za F_rr zato:
+        #   1) iz kontaktov vzamemo samo razmerje obremenitve levo/desno,
+        #   2) to razmerje nizkoprepustno filtriramo,
+        #   3) skupno efektivno obremenitev normaliziramo na m*g.
+        #
+        # Tako ohranimo vpliv asimetrije terena, ne pa numeričnih sunkov v skupnem Fz.
         mu_norm = self._clip(mu / 1.2, 0.0, 1.0)
         crr = self.p.crr_base + self.p.crr_lambda_gain * lam + self.p.crr_mu_gain * (1.0 - mu_norm)
 
-        if abs(v_body) > 1e-4 or abs(vcmd) > 1e-4:
-            rr_sign = self._sign_nonzero(v_body, fallback=vcmd)
-            Frr_left = -rr_sign * crr * Fz_left
-            Frr_right = -rr_sign * crr * Fz_right
-        else:
-            Frr_left = 0.0
-            Frr_right = 0.0
+        Fz_measured_total = max(1e-6, Fz_left + Fz_right)
+        left_fraction_raw = self._clip(Fz_left / Fz_measured_total, 0.05, 0.95)
+
+        rr_alpha = self._clip(
+            dt / max(self.p.rr_load_balance_tau_s, dt),
+            0.0,
+            1.0
+        )
+        self._rr_left_fraction_filt += rr_alpha * (
+            left_fraction_raw - self._rr_left_fraction_filt
+        )
+
+        Fz_rr_total = max(1.0, self.p.mass_kg * 9.81)
+        Fz_rr_left = self._rr_left_fraction_filt * Fz_rr_total
+        Fz_rr_right = (1.0 - self._rr_left_fraction_filt) * Fz_rr_total
+
+        # Upor vedno nasprotuje dejanskemu gibanju. tanh zagotovi gladko
+        # ugašanje pri v_body -> 0 in prepreči preklapljanje znaka/cukanje.
+        rr_velocity = v_body if abs(v_body) > 1e-6 else vcmd
+        rr_direction = np.tanh(
+            rr_velocity / max(self.p.rr_velocity_scale_mps, 1e-6)
+        )
+
+        Frr_left = -crr * Fz_rr_left * rr_direction
+        Frr_right = -crr * Fz_rr_right * rr_direction
 
         # Scrub torque upira relativnemu vrtenju na mestu.
-        scrub_sign = self._sign_nonzero(yaw_rate, fallback=omega_cmd)
+        scrub_sign = self._sign_nonzero(omega_body, fallback=omega_cmd)
         Mscrub_mag = (
             self.p.scrub_gain
             * mu
             * (1.0 + 1.4 * lam)
             * Fz_total
             * 0.5 * b
-            * np.tanh(abs(yaw_rate if abs(yaw_rate) > 1e-4 else omega_cmd) / self.p.scrub_omega_scale)
+            * np.tanh(abs(omega_body if abs(omega_body) > 1e-4 else omega_cmd) / self.p.scrub_omega_scale)
         )
         Mscrub = -scrub_sign * Mscrub_mag
 
@@ -294,11 +371,11 @@ class TerramechanicsCore:
 
         M_drive_net = 0.5 * b * (FR_net - FL_net)
 
-        v_track_left = v_body - 0.5 * b * yaw_rate
-        v_track_right = v_body + 0.5 * b * yaw_rate
+        v_track_left = v_body - 0.5 * b * omega_body
+        v_track_right = v_body + 0.5 * b * omega_body
         P_left = FL_drive * v_track_left
         P_right = FR_drive * v_track_right
-        P_scrub_loss = abs(Mscrub * yaw_rate)
+        P_scrub_loss = abs(Mscrub * omega_body)
         P_rr_loss = abs(Frr_left * v_track_left) + abs(Frr_right * v_track_right)
         P_signed = P_left + P_right - P_scrub_loss - P_rr_loss
         P_positive = max(P_left, 0.0) + max(P_right, 0.0) + P_scrub_loss + P_rr_loss
@@ -317,7 +394,8 @@ class TerramechanicsCore:
             "v_ref": float(v_ref),
             "omega_ref": float(omega_ref),
             "v_body": float(v_body),
-            "yaw_rate": float(yaw_rate),
+            "omega_body": float(omega_body),
+            "coast_mode": bool(coast),
             "sigma_v": float(sigma_v),
             "sigma_omega": float(sigma_omega),
             "mu": float(mu),
@@ -325,6 +403,12 @@ class TerramechanicsCore:
             "Fz_left_N": float(Fz_left),
             "Fz_right_N": float(Fz_right),
             "Fz_total_N": float(Fz_total),
+            "Fz_rr_total_N": float(Fz_rr_total),
+            "Fz_rr_left_N": float(Fz_rr_left),
+            "Fz_rr_right_N": float(Fz_rr_right),
+            "rr_left_fraction_raw": float(left_fraction_raw),
+            "rr_left_fraction_filt": float(self._rr_left_fraction_filt),
+            "rr_direction": float(rr_direction),
             "FL_drive_N": float(FL_drive),
             "FR_drive_N": float(FR_drive),
             "Frr_left_N": float(Frr_left),
@@ -370,12 +454,25 @@ class TankSimulator:
     MODE_PIVOT = "pivot"
     MODE_CIRCLE = "circle"
     MODE_FIGURE8 = "figure8"
+    MODE_COAST = "coast"
 
     # Barva trajektorije v obliki RGBA = rdeca, zelena, modra, prosojnost
     TRAJ_RGBA = np.array([0.0, 0.5, 1.0, 0.8], dtype=np.float32)
 
-    def __init__(self, xml_path: str):
-        self._experiment_name = Path(xml_path).stem
+    def __init__(self, xml_path: str, physics_mode: str = "hybrid"):
+        physics_mode = str(physics_mode).strip().lower()
+        if physics_mode not in ("native", "hybrid"):
+            raise ValueError("physics_mode mora biti 'native' ali 'hybrid'.")
+
+        self._physics_mode = physics_mode
+
+        # Koncna F2 nastavitev:
+        # - NATIVE: originalni MuJoCo friction/damping iz XML.
+        # - HYBRID: dokumentiran nizek MuJoCo friction profil + G4.
+        self._native_friction_profile = "xml"
+        self._wheel_damping_scale = 1.0
+        # Fizikalni nacin je del imena, da se native/hybrid rezultati ne prepisujejo.
+        self._experiment_name = f"{Path(xml_path).stem}_{self._physics_mode}"
 
         # Nalozi MuJoCo model iz XML datoteke
         self.model = mujoco.MjModel.from_xml_path(str(xml_path))
@@ -401,6 +498,12 @@ class TankSimulator:
 
         # Maksimalno trajanje posamezne voznje v sekundah simulacije
         self._drive_duration = 45.0
+
+        # Cas za umirjanje kontaktov po zagonu/resetu.
+        # V tem casu vozilo samo stoji in MuJoCo kontaktni solver se stabilizira.
+        # Namen je bolj ponovljiv coast-down test.
+        self._settling_time_s = 1.5
+        self._last_reset_sim_time = 0.0
 
         # Zacetni polozaj vozila ob zacetku voznje
         self._start_pos = None
@@ -481,11 +584,17 @@ class TankSimulator:
         self._contact_sample_every = 5
         self._wheel_names = [f"L{i}" for i in range(1, 7)] + [f"D{i}" for i in range(1, 7)]
 
+        # --- KONTROLNI TEST MuJoCo TRENJA IN DAMPINGA ---
+        # Originalne XML vrednosti shranimo takoj po nalaganju modela.
+        self._original_geom_friction = np.asarray(self.model.geom_friction, dtype=float).copy()
+        self._original_dof_damping = np.asarray(self.model.dof_damping, dtype=float).copy()
+
         # --- G4: TERRAMECHANICS / SLIP CORE ---
         # Stara verzija je ukaz samo zmanjsala in ga poslala v actuator ctrl.
         # G4 verzija racuna dejanske sile FL/FR, rolling resistance in scrub moment,
         # potem pa jih v MuJoCo vnese kot zunanje sile/momente na sasijo.
-        self._use_terramechanics_core = True
+        # HYBRID = MuJoCo kontakt + G4; NATIVE = samo MuJoCo.
+        self._use_terramechanics_core = (self._physics_mode == "hybrid")
         # Malo visja hitrost je potrebna, da krog in osmica v casu simulacije
         # zakljucita celoten manever tudi po upostevanju zdrsa.
         self._max_track_speed_mps = 3.5
@@ -542,6 +651,27 @@ class TankSimulator:
         # sigma_omega pa rotacijski del diferencialnega pogona.
         self._slip_log = []
         self._slip_sample_counter = 0
+        # Coast-down / body-state log: dejanska linearna in kotna hitrost sasije.
+        self._body_state_log = []
+        self._body_state_sample_counter = 0
+
+        # --- SKUPNI SIGNALNI LOG ---
+        # Profesorjeva zahteva: ukaz, referenca in dejansko stanje v istem CSV:
+        # v_cmd, v_ref, v_body, omega_cmd, omega_ref, omega_body
+        # + modelni in dejansko realizirani zdrs.
+        self._signal_log = []
+        self._signal_sample_counter = 0
+
+        # Cas preklopa v COAST glede na zacetek trenutne voznje [s].
+        self._coast_start_time_s = None
+
+        # --- COAST DIAGNOSTIKA ---
+        # Namen: preveriti celotno pot F_rr:
+        # TerramechanicsCore -> FL_net/FR_net -> data.ctrl -> actuator_force -> v_body.
+        self._coast_diag_log = []
+        self._coast_diag_last_print_t = -1e9
+        self._coast_diag_prev_t = None
+        self._coast_diag_prev_v = None
 
         # --- OCENA ENERGIJE POGONA ---
         # Mehansko moc pogona ocenimo iz MuJoCo actuator_force in actuator_velocity:
@@ -577,14 +707,86 @@ class TankSimulator:
             except Exception:
                 pass
 
-        # Pri G4 force-injection naj MuJoCo ne generira se enega locenega
-        # longitudinalnega pogona prek kontaktnega trenja. Normalne sile ostanejo,
-        # tangencialno trenje pa znižamo, da se izognemo dvojnemu trenju in nihanju.
-        self._configure_force_injection_contact_friction()
+        # HYBRID uporablja dokumentiran nizek MuJoCo friction profil, da se
+        # G4 upori in MuJoCo trenje ne stejejo dvakrat. NATIVE pusti friction iz XML.
+        if self._physics_mode == "hybrid":
+            self._configure_force_injection_contact_friction()
+            print("PHYSICS MODE = HYBRID | MuJoCo kontakt + G4.")
+        else:
+            self._configure_native_test_parameters()
+            print(
+                "PHYSICS MODE = NATIVE | samo MuJoCo, G4 izklopljen | "
+                "friction in damping ostaneta originalna iz XML."
+            )
 
     def _load_material_map(self, path):
         img = Image.open(str(path)).convert("RGB")
         return np.array(img, dtype=np.uint8)
+
+    def _wheel_geom_ids(self):
+        """Vrne geom ID-je vseh teles L1..L6 in D1..D6."""
+        geom_ids = set()
+        for body_name in self._wheel_names:
+            try:
+                bid = int(self.model.body(body_name).id)
+                adr = int(self.model.body_geomadr[bid])
+                num = int(self.model.body_geomnum[bid])
+                for gid in range(adr, adr + num):
+                    geom_ids.add(int(gid))
+            except Exception:
+                pass
+        return geom_ids
+
+    def _wheel_dof_ids(self):
+        """
+        Vrne DOF indekse jointov, ki pripadajo telesom L1..L6 in D1..D6.
+        Tako damping spreminjamo samo na kolesnih/pasivnih jointih, ne na freejointu sasije.
+        """
+        dof_ids = set()
+        for body_name in self._wheel_names:
+            try:
+                bid = int(self.model.body(body_name).id)
+                jadr = int(self.model.body_jntadr[bid])
+                jnum = int(self.model.body_jntnum[bid])
+                for jid in range(jadr, jadr + jnum):
+                    dadr = int(self.model.jnt_dofadr[jid])
+                    jtype = int(self.model.jnt_type[jid])
+
+                    # hinge/slide = 1 DOF; ball = 3; free = 6
+                    if jtype in (int(mujoco.mjtJoint.mjJNT_HINGE), int(mujoco.mjtJoint.mjJNT_SLIDE)):
+                        ndof = 1
+                    elif jtype == int(mujoco.mjtJoint.mjJNT_BALL):
+                        ndof = 3
+                    elif jtype == int(mujoco.mjtJoint.mjJNT_FREE):
+                        ndof = 6
+                    else:
+                        ndof = 1
+
+                    for did in range(dadr, min(dadr + ndof, self.model.nv)):
+                        dof_ids.add(int(did))
+            except Exception:
+                pass
+        return sorted(dof_ids)
+
+    def _configure_native_test_parameters(self):
+        """
+        Koncna F2 nastavitev za NATIVE nacin.
+
+        NATIVE uporablja izkljucno originalne MuJoCo nastavitve iz XML:
+          - geom_friction ostane iz XML,
+          - dof_damping ostane iz XML,
+          - G4 ni aktiven.
+
+        Funkcija eksplicitno povrne originalne vrednosti, da je obnasanje
+        dokumentirano in neodvisno od morebitne predhodne spremembe modela.
+        """
+        if self._physics_mode != "native":
+            return
+
+        self.model.geom_friction[:, :] = self._original_geom_friction
+        self.model.dof_damping[:] = self._original_dof_damping
+
+        print("NATIVE PARAMETRI | friction=XML | wheel damping=XML (scale=1.0)")
 
     def _configure_force_injection_contact_friction(self):
         """
@@ -712,11 +914,11 @@ class TankSimulator:
 
         forward_world, _left_world, up_world = self._body_frame_axes_locked()
         v_forward = float(np.dot(lin_world, forward_world))
-        yaw_rate = float(np.dot(ang_world, up_world))
+        omega_body = float(np.dot(ang_world, up_world))
 
         return {
             "v_forward": v_forward,
-            "yaw_rate": yaw_rate,
+            "omega_body": omega_body,
         }
 
     def _compute_contact_loads_locked(self):
@@ -1017,6 +1219,9 @@ class TankSimulator:
             "t": float(self.data.time - self._drive_start_t),
             "sim_time": float(self.data.time),
             "mode": str(mode),
+            "physics_mode": str(self._physics_mode),
+            "native_friction_profile": str(self._native_friction_profile),
+            "wheel_damping_scale": float(self._wheel_damping_scale),
             "x": float(pos[0]),
             "y": float(pos[1]),
             "z": float(pos[2]),
@@ -1048,6 +1253,312 @@ class TankSimulator:
         }
         with self._lock:
             self._slip_log.append(row)
+
+    def _sample_body_state_locked(self, mode: str, mat_name: str):
+        """Belezi dejansko hitrost sasije za drive in coast-down primerjavo."""
+        if mode is None:
+            return
+
+        self._body_state_sample_counter += 1
+        if self._body_state_sample_counter % self._contact_sample_every != 0:
+            return
+
+        state = self._body_planar_state_locked()
+        pos = self.data.body("sasija").xpos
+        row = {
+            "t": float(self.data.time - self._drive_start_t),
+            "sim_time": float(self.data.time),
+            "mode": str(mode),
+            "physics_mode": str(self._physics_mode),
+            "native_friction_profile": str(self._native_friction_profile),
+            "wheel_damping_scale": float(self._wheel_damping_scale),
+            "x": float(pos[0]),
+            "y": float(pos[1]),
+            "z": float(pos[2]),
+            "material": str(mat_name),
+            "v_body_mps": float(state["v_forward"]),
+            "omega_body_radps": float(state["omega_body"]),
+            "coast_active": int(mode == self.MODE_COAST),
+            "coast_start_time_s": (
+                "" if self._coast_start_time_s is None
+                else float(self._coast_start_time_s)
+            ),
+        }
+        with self._lock:
+            self._body_state_log.append(row)
+
+    @staticmethod
+    def _realized_slip(command_value: float, body_value: float, eps: float = 0.05):
+        """
+        Dejanski realizirani zdrs iz ukaza in dejanskega stanja.
+
+        sigma_real = 1 - body / command
+
+        Pri |command| < eps rezultat ni fizikalno uporaben zaradi deljenja z
+        zelo majhno vrednostjo, zato vrnemo NaN. To je posebej pomembno pri
+        vožnji naravnost za omega_cmd=0 in v COAST načinu.
+        """
+        command_value = float(command_value)
+        body_value = float(body_value)
+        if abs(command_value) < float(eps):
+            return float("nan")
+        return float(1.0 - body_value / command_value)
+
+    def _sample_signals_locked(
+        self,
+        mode: str,
+        mat_name: str,
+        mu: float,
+        lam: float,
+        drive_info: dict,
+        left_cmd: float,
+        right_cmd: float,
+    ):
+        """
+        Skupni CSV za neposredno primerjavo ukaza, reference in dejanskega stanja.
+
+        HYBRID:
+          v_cmd, omega_cmd = filtrirani ukaz G4
+          v_ref, omega_ref = referenca po modelnem zdrsu
+          sigma_model      = G4 sigma_v / sigma_omega
+
+        NATIVE:
+          G4 ni prisoten, zato definiramo:
+          v_ref = v_cmd, omega_ref = omega_cmd
+          sigma_model = NaN
+
+        Dejanski realizirani zdrs:
+          sigma_v_real     = 1 - v_body / v_cmd
+          sigma_omega_real = 1 - omega_body / omega_cmd
+
+        Kjer je ukaz približno 0, je sigma_real = NaN.
+        """
+        if mode is None:
+            return
+
+        self._signal_sample_counter += 1
+        if self._signal_sample_counter % self._contact_sample_every != 0:
+            return
+
+        state = self._body_planar_state_locked()
+        v_body = float(state["v_forward"])
+        omega_body = float(state["omega_body"])
+
+        # Osnovni GUI ukaz v fizikalnih enotah.
+        cmd_vel_raw = self._left_right_command_to_cmd_vel(left_cmd, right_cmd)
+
+        if mode == self.MODE_COAST:
+            v_cmd = 0.0
+            omega_cmd = 0.0
+            v_ref = 0.0
+            omega_ref = 0.0
+            sigma_v_model = float("nan")
+            sigma_omega_model = float("nan")
+
+        elif self._physics_mode == "hybrid" and drive_info is not None:
+            # Uporabimo dejanske vrednosti iz G4 po filtriranju ukaza.
+            v_cmd = float(drive_info.get("v_cmd", cmd_vel_raw["v_cmd"]))
+            omega_cmd = float(drive_info.get("omega_cmd", cmd_vel_raw["omega_cmd"]))
+            v_ref = float(drive_info.get("v_ref", v_cmd))
+            omega_ref = float(drive_info.get("omega_ref", omega_cmd))
+            sigma_v_model = float(drive_info.get("sigma_v", float("nan")))
+            sigma_omega_model = float(drive_info.get("sigma_omega", float("nan")))
+
+        else:
+            # Native nima lastnega slip/reference modela.
+            v_cmd = float(cmd_vel_raw["v_cmd"])
+            omega_cmd = float(cmd_vel_raw["omega_cmd"])
+            v_ref = v_cmd
+            omega_ref = omega_cmd
+            sigma_v_model = float("nan")
+            sigma_omega_model = float("nan")
+
+        sigma_v_real = self._realized_slip(v_cmd, v_body)
+        sigma_omega_real = self._realized_slip(omega_cmd, omega_body)
+
+        pos = self.data.body("sasija").xpos
+        row = {
+            "t": float(self.data.time - self._drive_start_t),
+            "sim_time": float(self.data.time),
+            "mode": str(mode),
+            "physics_mode": str(self._physics_mode),
+            "world": str(self._experiment_name),
+            "native_friction_profile": str(self._native_friction_profile),
+            "wheel_damping_scale": float(self._wheel_damping_scale),
+            "timestep_s": float(self.model.opt.timestep),
+            "integrator": int(self.model.opt.integrator),
+            "x": float(pos[0]),
+            "y": float(pos[1]),
+            "z": float(pos[2]),
+            "material": str(mat_name),
+            "mu": float(mu),
+            "lambda": float(lam),
+
+            "v_cmd_mps": float(v_cmd),
+            "v_ref_mps": float(v_ref),
+            "v_body_mps": float(v_body),
+
+            "omega_cmd_radps": float(omega_cmd),
+            "omega_ref_radps": float(omega_ref),
+            "omega_body_radps": float(omega_body),
+
+            "sigma_v_model": float(sigma_v_model),
+            "sigma_omega_model": float(sigma_omega_model),
+            "sigma_v_real": float(sigma_v_real),
+            "sigma_omega_real": float(sigma_omega_real),
+
+            "left_cmd_raw": float(left_cmd),
+            "right_cmd_raw": float(right_cmd),
+        }
+
+        if drive_info is not None:
+            row.update({
+                "Fz_left_N": float(drive_info.get("Fz_left_N", float("nan"))),
+                "Fz_right_N": float(drive_info.get("Fz_right_N", float("nan"))),
+                "FL_drive_N": float(drive_info.get("FL_drive_N", float("nan"))),
+                "FR_drive_N": float(drive_info.get("FR_drive_N", float("nan"))),
+                "Frr_left_N": float(drive_info.get("Frr_left_N", float("nan"))),
+                "Frr_right_N": float(drive_info.get("Frr_right_N", float("nan"))),
+                "Mscrub_Nm": float(drive_info.get("Mscrub_Nm", float("nan"))),
+            })
+        else:
+            row.update({
+                "Fz_left_N": float("nan"),
+                "Fz_right_N": float("nan"),
+                "FL_drive_N": float("nan"),
+                "FR_drive_N": float("nan"),
+                "Frr_left_N": float("nan"),
+                "Frr_right_N": float("nan"),
+                "Mscrub_Nm": float("nan"),
+            })
+
+        with self._lock:
+            self._signal_log.append(row)
+
+    def _sample_coast_diagnostics_locked(self, mode: str, mat_name: str, mu: float, lam: float):
+        """
+        Diagnostika samo za MODE_COAST.
+
+        Zabelezi:
+          - v_body in ocenjeni a_body,
+          - normalne sile,
+          - crr in Frr,
+          - drive/net sile,
+          - ukaz data.ctrl za SITE aktuatorja,
+          - dejansko MuJoCo actuator_force,
+          - vsoto pricakovane vzdolzne G4 sile.
+        """
+        if mode != self.MODE_COAST:
+            return
+
+        state = self._body_planar_state_locked()
+        v_body = float(state["v_forward"])
+        omega_body = float(state["omega_body"])
+        t_rel = float(self.data.time - self._drive_start_t)
+
+        # Numericna ocena vzdolznega pospeska iz dejanske hitrosti.
+        a_body = float("nan")
+        if self._coast_diag_prev_t is not None and self._coast_diag_prev_v is not None:
+            dtt = t_rel - float(self._coast_diag_prev_t)
+            if dtt > 1e-9:
+                a_body = (v_body - float(self._coast_diag_prev_v)) / dtt
+        self._coast_diag_prev_t = t_rel
+        self._coast_diag_prev_v = v_body
+
+        d = self._last_terramech or {}
+
+        def ctrl_value(act_id):
+            if act_id is None:
+                return float("nan")
+            return float(self._ctrl[int(act_id)])
+
+        def actuator_force_value(act_id):
+            if act_id is None:
+                return float("nan")
+            try:
+                return float(self.data.actuator_force[int(act_id)])
+            except Exception:
+                return float("nan")
+
+        ctrl_L = ctrl_value(self._drive_actuator_L_id)
+        ctrl_R = ctrl_value(self._drive_actuator_R_id)
+        ctrl_scrub = ctrl_value(self._scrub_actuator_id)
+
+        act_L = actuator_force_value(self._drive_actuator_L_id)
+        act_R = actuator_force_value(self._drive_actuator_R_id)
+        act_scrub = actuator_force_value(self._scrub_actuator_id)
+
+        Frr_L = float(d.get("Frr_left_N", float("nan")))
+        Frr_R = float(d.get("Frr_right_N", float("nan")))
+        FL_drive = float(d.get("FL_drive_N", float("nan")))
+        FR_drive = float(d.get("FR_drive_N", float("nan")))
+        FL_net = float(d.get("FL_net_N", float("nan")))
+        FR_net = float(d.get("FR_net_N", float("nan")))
+        Fz_L = float(d.get("Fz_left_N", float("nan")))
+        Fz_R = float(d.get("Fz_right_N", float("nan")))
+        Fz_rr_L = float(d.get("Fz_rr_left_N", float("nan")))
+        Fz_rr_R = float(d.get("Fz_rr_right_N", float("nan")))
+        Fz_rr_T = float(d.get("Fz_rr_total_N", float("nan")))
+        rr_balance = float(d.get("rr_left_fraction_filt", float("nan")))
+        rr_direction = float(d.get("rr_direction", float("nan")))
+        crr = float(d.get("crr", float("nan")))
+        Mscrub = float(d.get("Mscrub_Nm", float("nan")))
+
+        row = {
+            "t": t_rel,
+            "sim_time": float(self.data.time),
+            "physics_mode": str(self._physics_mode),
+            "material": str(mat_name),
+            "mu": float(mu),
+            "lambda": float(lam),
+            "v_body_mps": v_body,
+            "a_body_est_mps2": a_body,
+            "omega_body_radps": omega_body,
+            "Fz_left_N": Fz_L,
+            "Fz_right_N": Fz_R,
+            "Fz_total_N": Fz_L + Fz_R,
+            "Fz_rr_left_N": Fz_rr_L,
+            "Fz_rr_right_N": Fz_rr_R,
+            "Fz_rr_total_N": Fz_rr_T,
+            "rr_left_fraction_filt": rr_balance,
+            "rr_direction": rr_direction,
+            "crr": crr,
+            "FL_drive_N": FL_drive,
+            "FR_drive_N": FR_drive,
+            "Frr_left_N": Frr_L,
+            "Frr_right_N": Frr_R,
+            "Frr_total_N": Frr_L + Frr_R,
+            "FL_net_N": FL_net,
+            "FR_net_N": FR_net,
+            "Fnet_total_G4_N": FL_net + FR_net,
+            "Mscrub_Nm": Mscrub,
+            "ctrl_drive_L": ctrl_L,
+            "ctrl_drive_R": ctrl_R,
+            "ctrl_scrub": ctrl_scrub,
+            "actuator_force_drive_L": act_L,
+            "actuator_force_drive_R": act_R,
+            "actuator_force_scrub": act_scrub,
+            "site_actuator_drive": int(bool(self._site_actuator_drive)),
+        }
+
+        with self._lock:
+            self._coast_diag_log.append(row)
+
+        # Terminalski izpis priblizno 4x/s, da se lahko diagnosticira brez odpiranja CSV.
+        if t_rel - self._coast_diag_last_print_t >= 0.25:
+            self._coast_diag_last_print_t = t_rel
+            print(
+                "COAST DIAG | "
+                f"t={t_rel:6.3f}s | v={v_body:+.3f} m/s | a={a_body:+.3f} m/s^2 | "
+                f"Fz_raw={Fz_L + Fz_R:7.2f} N | Fz_rr={Fz_rr_T:7.2f} N | "
+                f"balL={rr_balance:.3f} | crr={crr:.4f} | "
+                f"Frr=({Frr_L:+.2f},{Frr_R:+.2f}) N sum={Frr_L + Frr_R:+.2f} | "
+                f"drive=({FL_drive:+.2f},{FR_drive:+.2f}) | "
+                f"net=({FL_net:+.2f},{FR_net:+.2f}) | "
+                f"ctrl=({ctrl_L:+.2f},{ctrl_R:+.2f}) | "
+                f"actF=({act_L:+.2f},{act_R:+.2f})"
+            )
+
 
     def _actuator_velocity_vector_locked(self):
         """
@@ -1210,6 +1721,9 @@ class TankSimulator:
             "t": float(self.data.time - self._drive_start_t),
             "sim_time": float(self.data.time),
             "mode": str(mode),
+            "physics_mode": str(self._physics_mode),
+            "native_friction_profile": str(self._native_friction_profile),
+            "wheel_damping_scale": float(self._wheel_damping_scale),
             "x": float(pos[0]),
             "y": float(pos[1]),
             "z": float(pos[2]),
@@ -1351,6 +1865,9 @@ class TankSimulator:
             "t": float(self.data.time - self._drive_start_t),
             "sim_time": float(self.data.time),
             "mode": str(mode),
+            "physics_mode": str(self._physics_mode),
+            "native_friction_profile": str(self._native_friction_profile),
+            "wheel_damping_scale": float(self._wheel_damping_scale),
             "x": float(pos[0]),
             "y": float(pos[1]),
             "z": float(pos[2]),
@@ -1379,6 +1896,10 @@ class TankSimulator:
             rows = list(self._contact_log)
             point_rows = list(self._contact_point_log)
             slip_rows = list(self._slip_log)
+            body_state_rows = list(self._body_state_log)
+            signal_rows = list(self._signal_log)
+            coast_start_time_s = self._coast_start_time_s
+            coast_diag_rows = list(self._coast_diag_log)
             energy_rows = list(self._energy_log)
             energy_per_actuator_positive_J = self._energy_per_actuator_positive_J.copy()
             energy_per_actuator_abs_J = self._energy_per_actuator_abs_J.copy()
@@ -1423,7 +1944,148 @@ class TankSimulator:
                 writer.writeheader()
                 writer.writerows(slip_rows)
 
-        # 4) CSV z oceno moci in energije pogona
+        # 4) CSV z dejanskim stanjem sasije; kljucen tudi za coast-down test.
+        body_state_csv_path = out_dir / f"{prefix}_body_state.csv"
+        if body_state_rows:
+            body_state_fieldnames = list(body_state_rows[0].keys())
+            with body_state_csv_path.open("w", newline="", encoding="utf-8") as f:
+                writer = csv.DictWriter(f, fieldnames=body_state_fieldnames)
+                writer.writeheader()
+                writer.writerows(body_state_rows)
+
+            # Graf dejanske linearne hitrosti; pri COAST mora po izklopu pogona pojemati.
+            bt = np.array([r["t"] for r in body_state_rows], dtype=float)
+            bv = np.array([r["v_body_mps"] for r in body_state_rows], dtype=float)
+            bw = np.array([r["omega_body_radps"] for r in body_state_rows], dtype=float)
+
+            png_body_v = out_dir / f"{prefix}_coastdown_v_body.png"
+            plt.figure(figsize=(10, 5))
+            plt.plot(bt, bv, label="v_body")
+            if coast_start_time_s is not None:
+                plt.axvline(
+                    float(coast_start_time_s),
+                    linestyle="--",
+                    linewidth=1.5,
+                    label="COAST - izklop pogona"
+                )
+            plt.xlabel("cas voznje [s]")
+            plt.ylabel("v_body [m/s]")
+            plt.title("Dejanska linearna hitrost sasije skozi cas")
+            plt.grid(True)
+            plt.legend()
+            plt.tight_layout()
+            plt.savefig(png_body_v, dpi=200)
+            plt.close()
+
+            png_body_w = out_dir / f"{prefix}_coastdown_omega_body.png"
+            plt.figure(figsize=(10, 5))
+            plt.plot(bt, bw, label="omega_body")
+            if coast_start_time_s is not None:
+                plt.axvline(
+                    float(coast_start_time_s),
+                    linestyle="--",
+                    linewidth=1.5,
+                    label="COAST - izklop pogona"
+                )
+            plt.xlabel("cas voznje [s]")
+            plt.ylabel("omega_body [rad/s]")
+            plt.title("Dejanska kotna hitrost sasije skozi cas")
+            plt.grid(True)
+            plt.legend()
+            plt.tight_layout()
+            plt.savefig(png_body_w, dpi=200)
+            plt.close()
+
+        # 4a) SKUPNI SIGNALNI CSV: cmd / ref / body / realized slip
+        signals_csv_path = out_dir / f"{prefix}_SIGNALS_REAL_SLIP.csv"
+        png_v_compare = None
+        png_omega_compare = None
+        png_real_slip = None
+
+        if signal_rows:
+            signal_fieldnames = list(signal_rows[0].keys())
+            with signals_csv_path.open("w", newline="", encoding="utf-8") as f:
+                writer = csv.DictWriter(f, fieldnames=signal_fieldnames)
+                writer.writeheader()
+                writer.writerows(signal_rows)
+
+            st = np.array([r["t"] for r in signal_rows], dtype=float)
+            v_cmd_arr = np.array([r["v_cmd_mps"] for r in signal_rows], dtype=float)
+            v_ref_arr = np.array([r["v_ref_mps"] for r in signal_rows], dtype=float)
+            v_body_arr = np.array([r["v_body_mps"] for r in signal_rows], dtype=float)
+
+            om_cmd_arr = np.array([r["omega_cmd_radps"] for r in signal_rows], dtype=float)
+            om_ref_arr = np.array([r["omega_ref_radps"] for r in signal_rows], dtype=float)
+            om_body_arr = np.array([r["omega_body_radps"] for r in signal_rows], dtype=float)
+
+            sv_real = np.array([r["sigma_v_real"] for r in signal_rows], dtype=float)
+            so_real = np.array([r["sigma_omega_real"] for r in signal_rows], dtype=float)
+            sv_model = np.array([r["sigma_v_model"] for r in signal_rows], dtype=float)
+            so_model = np.array([r["sigma_omega_model"] for r in signal_rows], dtype=float)
+
+            png_v_compare = out_dir / f"{prefix}_v_cmd_ref_body.png"
+            plt.figure(figsize=(10, 5))
+            plt.plot(st, v_cmd_arr, label="v_cmd")
+            plt.plot(st, v_ref_arr, label="v_ref")
+            plt.plot(st, v_body_arr, label="v_body")
+            if coast_start_time_s is not None:
+                plt.axvline(float(coast_start_time_s), linestyle="--", linewidth=1.5, label="COAST")
+            plt.xlabel("cas voznje [s]")
+            plt.ylabel("linearne hitrosti [m/s]")
+            plt.title("Ukaz, referenca in dejanska linearna hitrost")
+            plt.grid(True)
+            plt.legend()
+            plt.tight_layout()
+            plt.savefig(png_v_compare, dpi=200)
+            plt.close()
+
+            png_omega_compare = out_dir / f"{prefix}_omega_cmd_ref_body.png"
+            plt.figure(figsize=(10, 5))
+            plt.plot(st, om_cmd_arr, label="omega_cmd")
+            plt.plot(st, om_ref_arr, label="omega_ref")
+            plt.plot(st, om_body_arr, label="omega_body")
+            if coast_start_time_s is not None:
+                plt.axvline(float(coast_start_time_s), linestyle="--", linewidth=1.5, label="COAST")
+            plt.xlabel("cas voznje [s]")
+            plt.ylabel("kotne hitrosti [rad/s]")
+            plt.title("Ukaz, referenca in dejanska kotna hitrost")
+            plt.grid(True)
+            plt.legend()
+            plt.tight_layout()
+            plt.savefig(png_omega_compare, dpi=200)
+            plt.close()
+
+            png_real_slip = out_dir / f"{prefix}_modelni_in_realizirani_zdrs.png"
+            plt.figure(figsize=(10, 5))
+            if np.any(np.isfinite(sv_model)):
+                plt.plot(st, sv_model, label="sigma_v_model")
+            if np.any(np.isfinite(so_model)):
+                plt.plot(st, so_model, label="sigma_omega_model")
+            if np.any(np.isfinite(sv_real)):
+                plt.plot(st, sv_real, label="sigma_v_real")
+            if np.any(np.isfinite(so_real)):
+                plt.plot(st, so_real, label="sigma_omega_real")
+            if coast_start_time_s is not None:
+                plt.axvline(float(coast_start_time_s), linestyle="--", linewidth=1.5, label="COAST")
+            plt.xlabel("cas voznje [s]")
+            plt.ylabel("zdrs [-]")
+            plt.title("Modelni in dejansko realizirani zdrs")
+            plt.grid(True)
+            plt.legend()
+            plt.tight_layout()
+            plt.savefig(png_real_slip, dpi=200)
+            plt.close()
+
+        # 4b) Diagnostika poti terramehanske sile med COAST.
+        coast_diag_csv_path = out_dir / f"{prefix}_COAST_DIAGNOSTIKA.csv"
+        if coast_diag_rows:
+            diag_fieldnames = list(coast_diag_rows[0].keys())
+            with coast_diag_csv_path.open("w", newline="", encoding="utf-8") as f:
+                writer = csv.DictWriter(f, fieldnames=diag_fieldnames)
+                writer.writeheader()
+                writer.writerows(coast_diag_rows)
+
+        # 5) CSV z oceno moci in energije pogona
         energy_csv_path = out_dir / f"{prefix}_energija_pogona.csv"
         if energy_rows:
             energy_fieldnames = list(energy_rows[0].keys())
@@ -1670,6 +2332,13 @@ class TankSimulator:
             print(f"  CSV tocke: {points_csv_path}")
         if slip_rows:
             print(f"  CSV zdrs: {slip_csv_path}")
+        if signal_rows:
+            print(f"  CSV SIGNALI + realni zdrs: {signals_csv_path}")
+            print(f"  Graf v_cmd/v_ref/v_body: {png_v_compare}")
+            print(f"  Graf omega_cmd/omega_ref/omega_body: {png_omega_compare}")
+            print(f"  Graf modelni/realizirani zdrs: {png_real_slip}")
+        if coast_diag_rows:
+            print(f"  CSV COAST diagnostika: {coast_diag_csv_path}")
         if energy_rows:
             print(f"  CSV energija: {energy_csv_path}")
             print(f"  Energija pogona E+ = {energy_positive_total_J:.3f} J = {energy_positive_total_J / 3600.0:.6f} Wh")
@@ -1710,6 +2379,11 @@ class TankSimulator:
             "slip_csv": str(slip_csv_path) if slip_rows else None,
             "slip_png": str(png_slip) if png_slip is not None else None,
             "slip_commands_png": str(png_slip_commands) if png_slip_commands is not None else None,
+            "signals_csv": str(signals_csv_path) if signal_rows else None,
+            "v_cmd_ref_body_png": str(png_v_compare) if png_v_compare is not None else None,
+            "omega_cmd_ref_body_png": str(png_omega_compare) if png_omega_compare is not None else None,
+            "real_slip_png": str(png_real_slip) if png_real_slip is not None else None,
+            "coast_diag_csv": str(coast_diag_csv_path) if coast_diag_rows else None,
             "energy_csv": str(energy_csv_path) if energy_rows else None,
             "drive_power_png": str(png_drive_power) if png_drive_power is not None else None,
             "drive_energy_png": str(png_drive_energy) if png_drive_energy is not None else None,
@@ -1824,16 +2498,38 @@ class TankSimulator:
             self._add_capsule_locked(p1, p2)
 
     def _set_drive_locked(self, left: float, right: float):
-        """Nastavi ukaz leve in desne strani."""
-        # Prvih 6 aktuatorjev pripada levi strani
-        self.data.ctrl[:6] = left
+        """Nastavi native MuJoCo ukaz 6 levim in 6 desnim kolesnim aktuatorjem."""
+        # Najprej nicelni vsi aktuatorji, tudi G4 SITE aktuatorji.
+        self._ctrl[:] = 0.0
 
-        # Drugih 6 aktuatorjev pripada desni strani
-        self.data.ctrl[6:] = right
+        # Prvih 6 = leva stran, naslednjih 6 = desna stran.
+        n_left = min(6, self.model.nu)
+        n_right_end = min(12, self.model.nu)
+        if n_left > 0:
+            self._ctrl[:n_left] = float(left)
+        if n_right_end > 6:
+            self._ctrl[6:n_right_end] = float(right)
 
     def _start_drive(self, mode: str):
-        """Inicializira novo voznjo."""
-        print("Start mode:", mode)
+        """Inicializira novo voznjo po kratkem umirjanju kontaktov."""
+
+        # Po resetu mora MuJoCo nekaj casa teci brez pogona, da se kolesa usedejo
+        # na podlago in se kontaktne sile stabilizirajo.
+        with self._mj_lock:
+            settling_elapsed = float(self.data.time - self._last_reset_sim_time)
+
+        if settling_elapsed < self._settling_time_s:
+            remaining = self._settling_time_s - settling_elapsed
+            print(
+                f"UMIRJANJE KONTAKTOV: pocakaj se {remaining:.2f} s "
+                f"pred zacetkom testa."
+            )
+            return
+
+        print(
+            f"Start mode: {mode} | kontakti so se umirjali "
+            f"{settling_elapsed:.2f} s."
+        )
 
         with self._mj_lock:
             # Zabelezimo cas zacetka voznje v simulacijskem casu
@@ -1876,6 +2572,15 @@ class TankSimulator:
             self._contact_sample_counter = 0
             self._slip_log.clear()
             self._slip_sample_counter = 0
+            self._body_state_log.clear()
+            self._body_state_sample_counter = 0
+            self._signal_log.clear()
+            self._signal_sample_counter = 0
+            self._coast_start_time_s = None
+            self._coast_diag_log.clear()
+            self._coast_diag_last_print_t = -1e9
+            self._coast_diag_prev_t = None
+            self._coast_diag_prev_v = None
             self._energy_log.clear()
             self._energy_sample_counter = 0
             self._energy_signed_J = 0.0
@@ -1885,6 +2590,44 @@ class TankSimulator:
             self._energy_per_actuator_abs_J[:] = 0.0
             self._last_terramech = None
             self._terra_core.reset()
+
+    def _start_coast(self):
+        """
+        Preklopi trenutno voznjo v coast-down rezim.
+
+        Ne resetira casovnika ali logov. Aktivni pogon se izklopi,
+        G4 rolling resistance F_rr in scrub upor M_scrub pa ostaneta aktivna.
+        Tako lahko primerjamo native MuJoCo coast z MuJoCo + terramehaniko.
+        """
+        with self._lock:
+            if self._mode is None:
+                print("COAST: najprej zazeni NARAVNOST/PIVOT/KROG/OSMICO, nato pritisni COAST.")
+                return
+            drive_start_t = float(self._drive_start_t)
+            self._mode = self.MODE_COAST
+
+        with self._mj_lock:
+            coast_start_time_s = float(self.data.time - drive_start_t)
+
+            # Aktivni pogon takoj postavimo na 0. V naslednjem physics koraku
+            # TerramechanicsCore ponovno aplicira samo pasivna F_rr in M_scrub.
+            self._ctrl[:] = 0.0
+            self._qfrc_applied[:] = 0.0
+
+        with self._lock:
+            if self._coast_start_time_s is None:
+                self._coast_start_time_s = coast_start_time_s
+
+        if self._physics_mode == "hybrid":
+            print(
+                f"COAST HYBRID: aktivni pogon = 0; G4 F_rr in M_scrub ostaneta aktivna "
+                f"pri t={coast_start_time_s:.3f} s."
+            )
+        else:
+            print(
+                f"COAST NATIVE: aktivni pogon = 0; ostane samo pasivna MuJoCo dinamika "
+                f"pri t={coast_start_time_s:.3f} s."
+            )
 
     def _stop_drive(self):
         """Ustavi voznjo."""
@@ -1933,6 +2676,15 @@ class TankSimulator:
             self._contact_sample_counter = 0
             self._slip_log.clear()
             self._slip_sample_counter = 0
+            self._body_state_log.clear()
+            self._body_state_sample_counter = 0
+            self._signal_log.clear()
+            self._signal_sample_counter = 0
+            self._coast_start_time_s = None
+            self._coast_diag_log.clear()
+            self._coast_diag_last_print_t = -1e9
+            self._coast_diag_prev_t = None
+            self._coast_diag_prev_v = None
             self._energy_log.clear()
             self._energy_sample_counter = 0
             self._energy_signed_J = 0.0
@@ -1952,6 +2704,10 @@ class TankSimulator:
 
             # Izvede forward izracun, da se stanja in polozaji pravilno osvezijo
             mujoco.mj_forward(self.model, self.data)
+
+            # Po resetData je simulacijski cas praviloma 0. Ta trenutek shranimo,
+            # da naslednjih 1.5 s ne dovolimo zacetka meritve.
+            self._last_reset_sim_time = float(self.data.time)
 
             # Ce viewer obstaja, pobrisemo narisano trajektorijo
             if self._viewer is not None:
@@ -2036,58 +2792,110 @@ class TankSimulator:
                     left_cmd = 0.0
                     right_cmd = 0.0
 
-                if mode is not None:
-                    cmd_vel = self._left_right_command_to_cmd_vel(left_cmd, right_cmd)
-                    loads = self._compute_contact_loads_locked()
-                    state = self._body_planar_state_locked()
+                if self._physics_mode == "hybrid":
+                    # ============================================================
+                    # HYBRID: MuJoCo kontakt + G4 terramechanics/slip
+                    # ============================================================
+                    if mode == self.MODE_COAST:
+                        cmd_vel = {
+                            "v_cmd": 0.0,
+                            "omega_cmd": 0.0,
+                            "v_left_cmd_mps": 0.0,
+                            "v_right_cmd_mps": 0.0,
+                        }
+                        loads = self._compute_contact_loads_locked()
+                        state = self._body_planar_state_locked()
 
-                    # Brez yaw-hold stabilizacije:
-                    # - NARAVNOST ima left=1.0, right=1.0 -> omega_cmd = 0.0,
-                    # - G4 ne dodaja korekcije orientacije.
-                    # Tako se v trajektoriji vidi dejanski vpliv terena, kontaktov,
-                    # normalnih sil, zdrsa in uporov.
+                        terra = self._terra_core.step(
+                            dt,
+                            cmd=cmd_vel,
+                            terrain={"mu": mu, "lambda": lam, "material": mat_name},
+                            loads=loads,
+                            state=state,
+                            coast=True,
+                        )
 
-                    terra = self._terra_core.step(
-                        dt,
-                        cmd=cmd_vel,
-                        terrain={"mu": mu, "lambda": lam, "material": mat_name},
-                        loads=loads,
-                        state=state
-                    )
+                        drive_info = dict(terra)
+                        drive_info.update({
+                            "left_eff": 0.0,
+                            "right_eff": 0.0,
+                            "v_cmd_ideal": 0.0,
+                            "omega_cmd_ideal": 0.0,
+                            "v_cmd_eff": 0.0,
+                            "omega_cmd_eff": 0.0,
+                            "sigma_v_eff": float(terra["sigma_v"]),
+                            "sigma_omega_eff": float(terra["sigma_omega"]),
+                            "drive_gain_mu": float(mu),
+                            "traction_scale": 0.0,
+                            "left_cmd_raw": 0.0,
+                            "right_cmd_raw": 0.0,
+                        })
 
-                    b = max(0.05, float(self._track_width_m))
-                    left_eff = terra["v_ref"] - 0.5 * b * terra["omega_ref"]
-                    right_eff = terra["v_ref"] + 0.5 * b * terra["omega_ref"]
+                        self._ctrl[:] = 0.0
+                        self._apply_terramechanics_forces_locked(drive_info)
+                        self._last_terramech = drive_info
+                        traction_scale = 0.0
 
-                    drive_info = dict(terra)
-                    drive_info.update({
-                        # Stari kljuci ostanejo zaradi obstojecega logiranja/grafov.
-                        "left_eff": float(left_eff),
-                        "right_eff": float(right_eff),
-                        "v_cmd_ideal": float(cmd_vel["v_cmd"]),
-                        "omega_cmd_ideal": float(cmd_vel["omega_cmd"]),
-                        "v_cmd_eff": float(terra["v_ref"]),
-                        "omega_cmd_eff": float(terra["omega_ref"]),
-                        "sigma_v_eff": float(terra["sigma_v"]),
-                        "sigma_omega_eff": float(terra["sigma_omega"]),
-                        "drive_gain_mu": float(mu),
-                        "traction_scale": float(terra["traction_scale"]),
-                        "left_cmd_raw": float(left_cmd),
-                        "right_cmd_raw": float(right_cmd),
-                    })
+                    elif mode is not None:
+                        cmd_vel = self._left_right_command_to_cmd_vel(left_cmd, right_cmd)
+                        loads = self._compute_contact_loads_locked()
+                        state = self._body_planar_state_locked()
 
-                    traction_scale = drive_info["traction_scale"]
+                        terra = self._terra_core.step(
+                            dt,
+                            cmd=cmd_vel,
+                            terrain={"mu": mu, "lambda": lam, "material": mat_name},
+                            loads=loads,
+                            state=state
+                        )
 
-                    # Pogon je zdaj G4 force-injection, zato motornih ctrl ukazov ne uporabljamo.
-                    self._ctrl[:] = 0.0
-                    self._apply_terramechanics_forces_locked(drive_info)
-                    self._last_terramech = drive_info
+                        b = max(0.05, float(self._track_width_m))
+                        left_eff = terra["v_ref"] - 0.5 * b * terra["omega_ref"]
+                        right_eff = terra["v_ref"] + 0.5 * b * terra["omega_ref"]
+
+                        drive_info = dict(terra)
+                        drive_info.update({
+                            "left_eff": float(left_eff),
+                            "right_eff": float(right_eff),
+                            "v_cmd_ideal": float(cmd_vel["v_cmd"]),
+                            "omega_cmd_ideal": float(cmd_vel["omega_cmd"]),
+                            "v_cmd_eff": float(terra["v_ref"]),
+                            "omega_cmd_eff": float(terra["omega_ref"]),
+                            "sigma_v_eff": float(terra["sigma_v"]),
+                            "sigma_omega_eff": float(terra["sigma_omega"]),
+                            "drive_gain_mu": float(mu),
+                            "traction_scale": float(terra["traction_scale"]),
+                            "left_cmd_raw": float(left_cmd),
+                            "right_cmd_raw": float(right_cmd),
+                        })
+
+                        traction_scale = drive_info["traction_scale"]
+                        self._ctrl[:] = 0.0
+                        self._apply_terramechanics_forces_locked(drive_info)
+                        self._last_terramech = drive_info
+
+                    else:
+                        self._ctrl[:] = 0.0
+                        self._qfrc_applied[:] = 0.0
+                        self._last_terramech = None
 
                 else:
-                    # Ce ni aktivnega nacina, vse motorje in zunanje sile ustavimo.
-                    self._ctrl[:] = 0.0
+                    # ============================================================
+                    # NATIVE: cisti MuJoCo.
+                    # G4 step() se ne klice in G4 sile niso aplicirane.
+                    # Isti GUI left/right ukazi gredo v 12 kolesnih aktuatorjev.
+                    # ============================================================
                     self._qfrc_applied[:] = 0.0
                     self._last_terramech = None
+                    drive_info = None
+                    traction_scale = 1.0 if mode is not None and mode != self.MODE_COAST else 0.0
+
+                    if mode == self.MODE_COAST:
+                        self._ctrl[:] = 0.0
+                    elif mode is not None:
+                        self._set_drive_locked(left_cmd, right_cmd)
+                    else:
+                        self._ctrl[:] = 0.0
 
                 # Izpis samo, ko se material spremeni
                 if mat_id != self._last_material_id:
@@ -2099,7 +2907,10 @@ class TankSimulator:
                             f"scale={traction_scale:.2f}"
                         )
                     else:
-                        print(f"x={x:.2f}, y={y:.2f}, material={mat_name}")
+                        print(
+                            f"x={x:.2f}, y={y:.2f}, material={mat_name}, "
+                            f"physics={self._physics_mode}"
+                        )
                     self._last_material_id = mat_id
                 # Redek debug izpis
                 if self._traj_draw_counter % 200 == 0:
@@ -2122,6 +2933,11 @@ class TankSimulator:
                 # ko je stanje simulacije posodobljeno.
                 self._sample_contacts_locked(mode, mat_name, traction_scale)
                 self._sample_slip_locked(mode, mat_name, mu, lam, drive_info)
+                self._sample_body_state_locked(mode, mat_name)
+                self._sample_signals_locked(
+                    mode, mat_name, mu, lam, drive_info, left_cmd, right_cmd
+                )
+                self._sample_coast_diagnostics_locked(mode, mat_name, mu, lam)
                 self._sample_energy_locked(mode, mat_name, drive_info, dt)
 
                 # Ce gre tank predalec ali pade prenizko, naredimo reset
@@ -2551,6 +3367,15 @@ class TankSimulator:
             **btn_cfg
         ).pack(pady=4)
 
+        # Coast-down: izklopi aktivni pogon, vendar nadaljuje simulacijo in merjenje.
+        tk.Button(
+            self._root,
+            text="COAST (IZKLOP POGONA)",
+            command=self._start_coast,
+            bg="orange",
+            **btn_cfg
+        ).pack(pady=4)
+
         # Gumb za ustavitev
         tk.Button(
             self._root,
@@ -2614,6 +3439,12 @@ class TankSimulator:
         # Najprej zgradimo kontrolni GUI
         self._build_gui()
 
+        print(f"\n=== IZBRANI FIZIKALNI NACIN: {self._physics_mode.upper()} ===")
+        print(
+            f"Pred prvim testom pocakaj vsaj {self._settling_time_s:.1f} s, "
+            f"da se kontakti vozila s podlago umirijo."
+        )
+
         try:
             # Odpremo MuJoCo viewer v pasivnem nacinu
             with viewer.launch_passive(self.model, self.data) as v:
@@ -2672,17 +3503,26 @@ class TankSimulator:
 
 
 if __name__ == "__main__":
-    # Mapa, kjer lezi trenutna Python datoteka
+    parser = argparse.ArgumentParser(
+        description="Koncna F2 MuJoCo simulacija gosenicarja: native ali hybrid fizika."
+    )
+    parser.add_argument(
+        "--physics",
+        choices=("native", "hybrid"),
+        default="hybrid",
+        help=(
+            "native = cisti MuJoCo z originalnim XML friction/damping; "
+            "hybrid = MuJoCo kontakt + G4 terramechanics/slip "
+            "z dokumentiranim nizkim kontaktnim friction profilom."
+        ),
+    )
+    args = parser.parse_args()
+
     base = Path(__file__).resolve().parent
+    xml_path = base / "E1_asfalt.xml"
 
-    # Pot do XML modela. Popravljena verzija uporablja XML s SITE aktuatorji.
-    xml_path = base / "E3_neraven_asfalt.xml"
-    #if not xml_path.exists():
-        # Fallback, ce datoteko preimenujes nazaj v Neraven_teren.xml.
-       #xml_path = base / "Neraven_teren.xml"
-
-    # Ustvarimo simulator
-    sim = TankSimulator(str(xml_path))
-
-    # Zazenemo simulator
+    sim = TankSimulator(
+        str(xml_path),
+        physics_mode=args.physics,
+    )
     sim.run()
